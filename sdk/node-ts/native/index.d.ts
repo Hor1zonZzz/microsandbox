@@ -442,11 +442,8 @@ export declare class NetworkBuilder {
    * interface. The closure receives a fresh `InterfaceOverridesBuilder`.
    */
   interface(configure: (arg: InterfaceOverridesBuilder) => InterfaceOverridesBuilder): this
-  /**
-   * Set the violation action for secrets: `"block" | "block-and-log"
-   * | "block-and-terminate"`.
-   */
-  onSecretViolation(action: string): this
+  /** Configure the violation action for secrets. */
+  onSecretViolation(configure: (arg: JsViolationActionBuilder) => JsViolationActionBuilder): this
   /** Set the maximum number of concurrent connections. */
   maxConnections(max: number): this
   /** Set the IPv4 pool used for per-sandbox /30 guest subnets. */
@@ -1137,6 +1134,8 @@ export declare class SecretBuilder {
   injectQuery(enabled: boolean): this
   /** Configure request body injection (default: false). */
   injectBody(enabled: boolean): this
+  /** Configure violation behavior for this secret. */
+  onViolation(configure: (arg: JsViolationActionBuilder) => JsViolationActionBuilder): this
   /**
    * Materialize into a `SecretEntry`. Panics if `env` or `value` weren't
    * set (matches the underlying Rust builder's contract; surface as a
@@ -1252,6 +1251,24 @@ export declare class TlsBuilder {
   build(): TlsConfig
 }
 export type JsTlsBuilder = TlsBuilder
+
+/** Fluent builder for secret violation behavior. */
+export declare class ViolationActionBuilder {
+  constructor()
+  /** Block the request silently. */
+  block(): this
+  /** Block the request and log a warning. */
+  blockAndLog(): this
+  /** Block the request and terminate the sandbox. */
+  blockAndTerminate(): this
+  /** Allow an exact host to receive placeholders unchanged. */
+  passthroughHost(host: string): this
+  /** Allow hosts matching a wildcard pattern to receive placeholders unchanged. */
+  passthroughHostPattern(pattern: string): this
+  /** Allow any host to receive placeholders unchanged. */
+  passthroughAllHosts(iUnderstand: boolean): this
+}
+export type JsViolationActionBuilder = ViolationActionBuilder
 
 export declare class Volume {
   static get(name: string): Promise<VolumeHandle>

@@ -68,6 +68,58 @@ class ViolationAction(enum.StrEnum):
     BLOCK = "block"
     BLOCK_AND_LOG = "block-and-log"
     BLOCK_AND_TERMINATE = "block-and-terminate"
+    PASSTHROUGH = "passthrough"
+
+@dataclass(frozen=True, slots=True)
+class ViolationPolicy:
+    """Secret violation behavior, including optional passthrough hosts."""
+    fallback: ViolationAction = ViolationAction.BLOCK_AND_LOG
+    passthrough_hosts: tuple[str, ...] = ()
+    passthrough_host_patterns: tuple[str, ...] = ()
+    passthrough_all_hosts: bool = False
+
+    @classmethod
+    def block(cls) -> ViolationPolicy:
+        return cls(fallback=ViolationAction.BLOCK)
+
+    @classmethod
+    def block_and_log(cls) -> ViolationPolicy:
+        return cls(fallback=ViolationAction.BLOCK_AND_LOG)
+
+    @classmethod
+    def block_and_terminate(cls) -> ViolationPolicy:
+        return cls(fallback=ViolationAction.BLOCK_AND_TERMINATE)
+
+    @classmethod
+    def passthrough(
+        cls,
+        *,
+        hosts: Sequence[str] = (),
+        host_patterns: Sequence[str] = (),
+        all_hosts: bool = False,
+    ) -> ViolationPolicy:
+        return cls(
+            passthrough_hosts=tuple(hosts),
+            passthrough_host_patterns=tuple(host_patterns),
+            passthrough_all_hosts=all_hosts,
+        )
+
+    def _to_dict(self) -> str | dict:
+        if (
+            not self.passthrough_hosts
+            and not self.passthrough_host_patterns
+            and not self.passthrough_all_hosts
+        ):
+            return str(self.fallback)
+
+        passthrough: dict = {}
+        if self.passthrough_hosts:
+            passthrough["hosts"] = list(self.passthrough_hosts)
+        if self.passthrough_host_patterns:
+            passthrough["host_patterns"] = list(self.passthrough_host_patterns)
+        if self.passthrough_all_hosts:
+            passthrough["all_hosts"] = True
+        return {"passthrough": passthrough}
 
 class MountKind(enum.StrEnum):
     BIND = "bind"
@@ -508,7 +560,7 @@ class SecretEntry:
     allow_host_patterns: tuple[str, ...] = ()
     placeholder: str | None = None
     require_tls: bool = True
-    on_violation: ViolationAction = ViolationAction.BLOCK_AND_LOG
+    on_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG
     injection: SecretInjection = field(default_factory=SecretInjection)
 
     def _to_dict(self) -> dict:
@@ -521,8 +573,9 @@ class SecretEntry:
             d["placeholder"] = self.placeholder
         if not self.require_tls:
             d["require_tls"] = False
-        if self.on_violation != ViolationAction.BLOCK_AND_LOG:
-            d["on_violation"] = str(self.on_violation)
+        violation = violation_policy_to_dict(self.on_violation)
+        if violation != str(ViolationAction.BLOCK_AND_LOG):
+            d["on_violation"] = violation
         injection = self.injection._to_dict()
         if injection:
             d["injection"] = injection
@@ -540,7 +593,7 @@ class Secret:
         allow_host_patterns: Sequence[str] = (),
         placeholder: str | None = None,
         require_tls: bool = True,
-        on_violation: ViolationAction = ViolationAction.BLOCK_AND_LOG,
+        on_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG,
         injection: SecretInjection | None = None,
     ) -> SecretEntry:
         return SecretEntry(
@@ -727,6 +780,7 @@ class Network:
     """IPv6 pool used to derive per-sandbox /64 guest prefixes. Defaults
     to ``fd42:6d73:62::/48``."""
     max_connections: int | None = None
+    on_secret_violation: ViolationAction | ViolationPolicy = ViolationAction.BLOCK_AND_LOG
 
     @classmethod
     def none(cls) -> Network:
@@ -768,7 +822,16 @@ class Network:
             d["ipv6_pool"] = self.ipv6_pool
         if self.max_connections is not None:
             d["max_connections"] = self.max_connections
+        violation = violation_policy_to_dict(self.on_secret_violation)
+        if violation != str(ViolationAction.BLOCK_AND_LOG):
+            d["on_secret_violation"] = violation
         return d
+
+
+def violation_policy_to_dict(policy: ViolationAction | ViolationPolicy) -> str | dict:
+    if isinstance(policy, ViolationPolicy):
+        return policy._to_dict()
+    return str(policy)
 
 #--------------------------------------------------------------------------------------------------
 # Types: Registry Auth

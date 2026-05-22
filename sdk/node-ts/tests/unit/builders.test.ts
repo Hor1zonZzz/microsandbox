@@ -9,6 +9,7 @@ import {
   NetworkBuilder,
   PatchBuilder,
   Sandbox,
+  SecretBuilder,
   Stdin,
 } from "../../dist/index.js";
 
@@ -350,6 +351,48 @@ describe("NetworkBuilder.secretEnvSimple (3-arg shorthand)", () => {
     expect(cfg.secrets.secrets[0].envVar).toBe("API_KEY");
     // Placeholder defaults to the value when omitted.
     expect(cfg.secrets.secrets[0].placeholder).toBe("sk-abc");
+  });
+});
+
+describe("NetworkBuilder secret passthrough", () => {
+  it("builds global passthrough violation policy", () => {
+    const cfg = new NetworkBuilder()
+      .onSecretViolation((v) =>
+        v
+          .blockAndTerminate()
+          .passthroughHost("api.anthropic.com")
+          .passthroughHostPattern("*.anthropic.com"),
+      )
+      .build() as {
+      secrets: {
+        onViolation: {
+          passthrough: unknown[];
+        };
+      };
+    };
+
+    expect(cfg.secrets.onViolation).toEqual({
+      passthrough: [
+        { exact: "api.anthropic.com" },
+        { wildcard: "*.anthropic.com" },
+      ],
+    });
+  });
+
+  it("builds per-secret passthrough violation policy", () => {
+    const secret = new SecretBuilder()
+      .env("API_KEY")
+      .value("sk-abc")
+      .allowHost("api.github.com")
+      .onViolation((v) =>
+        v
+          .blockAndLog()
+          .passthroughHost("api.anthropic.com")
+          .passthroughHostPattern("*.anthropic.com"),
+      )
+      .build();
+
+    expect(secret.allowedHosts).toEqual(["api.github.com"]);
   });
 });
 

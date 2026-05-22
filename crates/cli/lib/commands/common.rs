@@ -272,7 +272,7 @@ pub struct SandboxOpts {
     #[arg(long)]
     pub secret: Vec<String>,
 
-    /// Action when a secret is sent to a disallowed host (block, block-and-log, block-and-terminate).
+    /// Action when a secret is sent to a disallowed host (block, block-and-log, block-and-terminate, passthrough).
     #[cfg(feature = "net")]
     #[arg(long)]
     pub on_secret_violation: Option<String>,
@@ -712,7 +712,9 @@ fn apply_network_opts(
                 n = n.trust_host_cas(true);
             }
             if let Some(action) = violation_action {
-                n = n.on_secret_violation(action);
+                n = n.on_secret_violation(|_| {
+                    microsandbox_network::builder::ViolationActionBuilder::from_action(action)
+                });
             }
 
             // TLS configuration.
@@ -961,14 +963,15 @@ fn parse_secret(spec: &str) -> anyhow::Result<(String, String, String)> {
 fn parse_violation_action(
     s: &Option<String>,
 ) -> anyhow::Result<Option<microsandbox_network::secrets::config::ViolationAction>> {
-    use microsandbox_network::secrets::config::ViolationAction;
+    use microsandbox_network::secrets::config::{HostPattern, ViolationAction};
     match s.as_deref() {
         None => Ok(None),
         Some("block") => Ok(Some(ViolationAction::Block)),
         Some("block-and-log") => Ok(Some(ViolationAction::BlockAndLog)),
         Some("block-and-terminate") => Ok(Some(ViolationAction::BlockAndTerminate)),
+        Some("passthrough") => Ok(Some(ViolationAction::Passthrough(vec![HostPattern::Any]))),
         Some(other) => anyhow::bail!(
-            "invalid violation action: {other} (expected: block, block-and-log, block-and-terminate)"
+            "invalid violation action: {other} (expected: block, block-and-log, block-and-terminate, passthrough)"
         ),
     }
 }
@@ -1252,6 +1255,19 @@ mod tests {
     use microsandbox::sandbox::{HostPermissions, StatVirtualization, VolumeMount};
 
     use super::*;
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_violation_action_accepts_passthrough() {
+        let action = parse_violation_action(&Some("passthrough".to_string()))
+            .expect("passthrough should parse")
+            .expect("action should be present");
+
+        assert!(matches!(
+            action,
+            microsandbox_network::secrets::config::ViolationAction::Passthrough(_)
+        ));
+    }
 
     //----------------------------------------------------------------------------------------------
     // Tests: apply_volume / -v parser
