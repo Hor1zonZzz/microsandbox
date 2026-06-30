@@ -13,7 +13,8 @@ use sea_orm::EntityTrait;
 use crate::{
     MicrosandboxResult,
     backend::{
-        Backend, CloudSandbox, SandboxHandleCloudState, SandboxHandleInner, SandboxHandleLocalState,
+        Backend, CloudCreateSandboxRequest, CloudSandbox, SandboxHandleCloudState,
+        SandboxHandleInner, SandboxHandleLocalState,
     },
     db::entity::sandbox as sandbox_entity,
 };
@@ -510,7 +511,24 @@ impl SandboxHandle {
     /// Wait until this sandbox is observed in a terminal non-running state.
     pub async fn wait_until_stopped(&self) -> MicrosandboxResult<SandboxStopResult> {
         loop {
-            let current = self.refresh().await?;
+            let current = match self.refresh().await {
+                Ok(current) => current,
+                Err(err)
+                    if matches!(err, crate::MicrosandboxError::SandboxNotFound(_))
+                        && self.backend_kind() == crate::backend::BackendKind::Cloud
+                        && self.cloud_is_ephemeral() =>
+                {
+                    return Ok(SandboxStopResult {
+                        name: self.name.clone(),
+                        status: SandboxStatus::Stopped,
+                        exit_code: None,
+                        signal: None,
+                        observed_at: chrono::Utc::now(),
+                        source: Some("cloud ephemeral sandbox no longer found".to_string()),
+                    });
+                }
+                Err(err) => return Err(err),
+            };
             let status = current.status_snapshot();
             if sandbox_status_is_terminal(status) {
                 return Ok(SandboxStopResult {
@@ -525,6 +543,15 @@ impl SandboxHandle {
 
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    fn cloud_is_ephemeral(&self) -> bool {
+        self.cloud()
+            .and_then(|cloud| {
+                serde_json::from_str::<CloudCreateSandboxRequest>(&cloud.config_json).ok()
+            })
+            .map(|req| req.ephemeral)
+            .unwrap_or(false)
     }
 
     /// Remove this sandbox.

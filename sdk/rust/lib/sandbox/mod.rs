@@ -1348,12 +1348,29 @@ impl Sandbox {
             return Ok(stop_result_from_exit_status(&self.name, status));
         }
 
-        self.backend
+        match self
+            .backend
             .sandboxes()
             .get(self.backend.clone(), &self.name)
-            .await?
-            .wait_until_stopped()
             .await
+        {
+            Ok(handle) => handle.wait_until_stopped().await,
+            Err(err)
+                if matches!(err, crate::MicrosandboxError::SandboxNotFound(_))
+                    && self.backend_kind() == crate::backend::BackendKind::Cloud
+                    && self.config.spec.lifecycle.ephemeral =>
+            {
+                Ok(SandboxStopResult {
+                    name: self.name.clone(),
+                    status: SandboxStatus::Stopped,
+                    exit_code: None,
+                    signal: None,
+                    observed_at: chrono::Utc::now(),
+                    source: Some("cloud ephemeral sandbox no longer found".to_string()),
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Detach this handle without stopping the sandbox.

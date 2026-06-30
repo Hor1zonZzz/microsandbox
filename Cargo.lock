@@ -3559,6 +3559,7 @@ dependencies = [
  "microsandbox",
  "microsandbox-protocol",
  "microsandbox-types",
+ "microsandbox-utils",
  "serde",
  "serde_json",
  "tokio",
