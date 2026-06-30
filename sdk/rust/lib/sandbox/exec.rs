@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use bytes::Bytes;
 use microsandbox_protocol::{
     exec::{ExecResize, ExecSignal, ExecStdin},
-    message::MessageType,
+    message::{Message, MessageType},
 };
 use tokio::sync::mpsc;
 
@@ -98,8 +98,8 @@ pub struct ExecHandle {
     /// Stdin sink (only if `StdinMode::Pipe` was used).
     stdin: Option<ExecSink>,
 
-    /// Bridge reference for sending signals/stdin.
-    client: Arc<AgentClient>,
+    /// Transport for sending signals/stdin.
+    transport: ExecTransport,
 }
 
 /// Cloneable control handle for a streaming exec session.
@@ -108,8 +108,8 @@ pub struct ExecControl {
     /// Correlation ID for this session.
     id: u32,
 
-    /// Bridge reference for sending control messages.
-    client: Arc<AgentClient>,
+    /// Transport for sending control messages.
+    transport: ExecTransport,
 }
 
 /// Events emitted by a streaming exec session.
@@ -147,7 +147,13 @@ pub enum ExecEvent {
 /// Sink for writing to a running process's stdin.
 pub struct ExecSink {
     id: u32,
-    client: Arc<AgentClient>,
+    transport: ExecTransport,
+}
+
+#[derive(Clone)]
+pub(crate) enum ExecTransport {
+    Agent(Arc<AgentClient>),
+    Cloud(mpsc::UnboundedSender<Message>),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -321,7 +327,22 @@ impl ExecHandle {
             id,
             events,
             stdin,
-            client,
+            transport: ExecTransport::Agent(client),
+        }
+    }
+
+    /// Create a new cloud-backed exec handle.
+    pub(crate) fn new_cloud(
+        id: u32,
+        events: mpsc::UnboundedReceiver<ExecEvent>,
+        stdin: Option<ExecSink>,
+        tx: mpsc::UnboundedSender<Message>,
+    ) -> Self {
+        Self {
+            id,
+            events,
+            stdin,
+            transport: ExecTransport::Cloud(tx),
         }
     }
 
@@ -334,7 +355,7 @@ impl ExecHandle {
     pub fn control(&self) -> ExecControl {
         ExecControl {
             id: self.id,
-            client: Arc::clone(&self.client),
+            transport: self.transport.clone(),
         }
     }
 
@@ -350,7 +371,7 @@ impl ExecHandle {
         (
             ExecControl {
                 id: self.id,
-                client: Arc::clone(&self.client),
+                transport: self.transport.clone(),
             },
             self.stdin,
             self.events,
@@ -460,7 +481,7 @@ impl ExecControl {
     /// running process inside the guest.
     pub async fn signal(&self, signal: i32) -> MicrosandboxResult<()> {
         let payload = ExecSignal { signal };
-        self.client
+        self.transport
             .send(self.id, MessageType::ExecSignal, &payload)
             .await?;
         Ok(())
@@ -474,7 +495,7 @@ impl ExecControl {
     /// Resize the PTY for this session.
     pub async fn resize(&self, rows: u16, cols: u16) -> MicrosandboxResult<()> {
         let payload = ExecResize { rows, cols };
-        self.client
+        self.transport
             .send(self.id, MessageType::ExecResize, &payload)
             .await?;
         Ok(())
@@ -484,7 +505,18 @@ impl ExecControl {
 impl ExecSink {
     /// Create a new stdin sink.
     pub(crate) fn new(id: u32, client: Arc<AgentClient>) -> Self {
-        Self { id, client }
+        Self {
+            id,
+            transport: ExecTransport::Agent(client),
+        }
+    }
+
+    /// Create a new cloud-backed stdin sink.
+    pub(crate) fn new_cloud(id: u32, tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            id,
+            transport: ExecTransport::Cloud(tx),
+        }
     }
 
     /// Write data to the process's stdin.
@@ -492,7 +524,7 @@ impl ExecSink {
         let payload = ExecStdin {
             data: data.as_ref().to_vec(),
         };
-        self.client
+        self.transport
             .send(self.id, MessageType::ExecStdin, &payload)
             .await?;
         Ok(())
@@ -501,10 +533,32 @@ impl ExecSink {
     /// Close stdin (sends EOF to the process).
     pub async fn close(&self) -> MicrosandboxResult<()> {
         let payload = ExecStdin { data: Vec::new() };
-        self.client
+        self.transport
             .send(self.id, MessageType::ExecStdin, &payload)
             .await?;
         Ok(())
+    }
+}
+
+impl ExecTransport {
+    async fn send<T: serde::Serialize>(
+        &self,
+        id: u32,
+        t: MessageType,
+        payload: &T,
+    ) -> MicrosandboxResult<()> {
+        match self {
+            Self::Agent(client) => {
+                client.send(id, t, payload).await?;
+                Ok(())
+            }
+            Self::Cloud(tx) => {
+                let msg = Message::with_payload(t, id, payload)?;
+                tx.send(msg).map_err(|_| {
+                    crate::MicrosandboxError::Runtime("cloud exec websocket writer closed".into())
+                })
+            }
+        }
     }
 }
 

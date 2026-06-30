@@ -671,6 +671,186 @@ export type CloudMessageResponse = {
  */
 message: string, };
 
+export type CloudSandboxMetrics = {
+/**
+ * CPU usage as a percentage across all host CPUs.
+ */
+cpu_percent: number,
+/**
+ * Cumulative guest vCPU execution time across all vCPUs.
+ */
+vcpu_time_ns: number,
+/**
+ * Resident memory usage in bytes.
+ */
+memory_bytes: number,
+/**
+ * Guest-available memory in bytes when reported by the guest.
+ */
+memory_available_bytes?: number | null,
+/**
+ * Host-resident guest memory in bytes for capacity diagnostics.
+ */
+memory_host_resident_bytes?: number | null,
+/**
+ * Configured guest memory limit in bytes.
+ */
+memory_limit_bytes: number,
+/**
+ * Cumulative disk bytes read by the sandbox process.
+ */
+disk_read_bytes: number,
+/**
+ * Cumulative disk bytes written by the sandbox process.
+ */
+disk_write_bytes: number,
+/**
+ * Cumulative network bytes delivered from the runtime to the guest.
+ */
+net_rx_bytes: number,
+/**
+ * Cumulative network bytes transmitted from the guest into the runtime.
+ */
+net_tx_bytes: number,
+/**
+ * Guest-visible OCI upper filesystem used bytes when available.
+ */
+upper_used_bytes?: number | null,
+/**
+ * Guest-visible OCI upper filesystem free bytes when available.
+ */
+upper_free_bytes?: number | null,
+/**
+ * Host-allocated bytes for the writable upper image when available.
+ */
+upper_host_allocated_bytes?: number | null,
+/**
+ * Sandbox uptime in milliseconds.
+ */
+uptime_ms: number,
+/**
+ * Timestamp of the sample.
+ */
+timestamp: string, };
+
+export type CloudFsEntryKind = "file" | "directory" | "symlink" | "other";
+
+export type CloudFsEntry = {
+/**
+ * Path of the entry.
+ */
+path: string,
+/**
+ * Kind of entry.
+ */
+kind: CloudFsEntryKind,
+/**
+ * Size in bytes.
+ */
+size: number,
+/**
+ * Unix permission bits.
+ */
+mode: number,
+/**
+ * Last modification time.
+ */
+modified?: string | null, };
+
+export type CloudFsMetadata = {
+/**
+ * Kind of entry.
+ */
+kind: CloudFsEntryKind,
+/**
+ * Size in bytes.
+ */
+size: number,
+/**
+ * Unix permission bits.
+ */
+mode: number,
+/**
+ * Whether the entry is read-only.
+ */
+readonly: boolean,
+/**
+ * Last modification time.
+ */
+modified?: string | null,
+/**
+ * Creation time.
+ */
+created?: string | null, };
+
+export type CloudFsExistsResponse = {
+/**
+ * Whether the path exists.
+ */
+exists: boolean, };
+
+export type CloudFsPathRequest = {
+/**
+ * Guest path.
+ */
+path: string, };
+
+export type CloudFsTwoPathRequest = {
+/**
+ * Source guest path.
+ */
+from: string,
+/**
+ * Destination guest path.
+ */
+to: string, };
+
+export type CloudVolume = {
+/**
+ * Server-side UUID.
+ */
+id: string,
+/**
+ * Owning org's UUID.
+ */
+org_id: string,
+/**
+ * User-facing volume name.
+ */
+name: string,
+/**
+ * Storage kind.
+ */
+kind: VolumeKind,
+/**
+ * Configured quota in MiB, when set.
+ */
+quota_mib?: number | null,
+/**
+ * Disk usage snapshot at handle-fetch time.
+ */
+used_bytes: number,
+/**
+ * Disk capacity in bytes for disk volumes.
+ */
+capacity_bytes?: number | null,
+/**
+ * Disk image format for disk volumes.
+ */
+disk_format?: string | null,
+/**
+ * Inner disk filesystem for disk volumes.
+ */
+disk_fstype?: string | null,
+/**
+ * Key-value labels associated with the volume.
+ */
+labels: Array<[string, string]>,
+/**
+ * Creation timestamp.
+ */
+created_at?: string | null, };
+
 export type CloudErrorBody = {
 /**
  * Flat machine-readable error code, when returned in this shape.

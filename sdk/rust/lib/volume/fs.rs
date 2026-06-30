@@ -3,8 +3,7 @@
 //! Unlike [`SandboxFs`](crate::sandbox::fs::SandboxFs) which goes through the
 //! agent protocol, [`VolumeFs`] reads + writes a volume's bytes directly. For
 //! the local backend that is `tokio::fs` against `volumes_dir/<name>/`; for
-//! cloud (Phase 6) it routes through msb-cloud HTTP. Today every cloud op
-//! returns [`crate::MicrosandboxError::Unsupported`].
+//! cloud it routes through msb-cloud-compatible HTTP.
 //!
 //! `VolumeFs` is a single type per D6.4 — no public variants. It borrows the
 //! parent volume's `Arc<dyn Backend>` + name and dispatches through the
@@ -13,7 +12,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 use crate::backend::Backend;
 use crate::{
@@ -36,44 +37,78 @@ const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 ///
 /// Borrows the parent volume's `Arc<dyn Backend>` + name and dispatches every
 /// op through the [`VolumeBackend`](crate::backend::VolumeBackend) trait.
-/// Local routes to `tokio::fs`; cloud returns `Unsupported` until Phase 6.
+/// Local routes to `tokio::fs`; cloud routes through the configured cloud
+/// backend.
 pub struct VolumeFs<'a> {
     backend: Arc<dyn Backend>,
     name: &'a str,
 }
 
-/// A streaming reader for file data from a volume's host-side directory.
-///
-/// **Local backend only** — opened from a host path. Cloud streaming flows
-/// through `VolumeFs::read_stream` will land alongside the cloud HTTP routes
-/// in Phase 6.
+/// A streaming reader for file data from a volume.
 pub struct VolumeFsReadStream {
-    file: tokio::fs::File,
-    buf: Vec<u8>,
+    inner: VolumeFsReadStreamInner,
+}
+
+enum VolumeFsReadStreamInner {
+    File { file: tokio::fs::File, buf: Vec<u8> },
+    Single(Option<Bytes>),
 }
 
 impl VolumeFsReadStream {
     /// Construct from an already-opened file. Local impl only.
     pub(crate) fn from_file(file: tokio::fs::File) -> Self {
         Self {
-            file,
-            buf: vec![0u8; STREAM_CHUNK_SIZE],
+            inner: VolumeFsReadStreamInner::File {
+                file,
+                buf: vec![0u8; STREAM_CHUNK_SIZE],
+            },
+        }
+    }
+
+    /// Construct from a single in-memory chunk. Cloud impl only.
+    pub(crate) fn from_bytes(data: Bytes) -> Self {
+        Self {
+            inner: VolumeFsReadStreamInner::Single(Some(data)),
         }
     }
 }
 
-/// A streaming writer for file data to a volume's host-side directory.
-///
-/// **Local backend only** — opened against a host path. Cloud streaming will
-/// land alongside the cloud HTTP routes in Phase 6.
+/// A streaming writer for file data to a volume.
 pub struct VolumeFsWriteSink {
-    file: tokio::fs::File,
+    inner: VolumeFsWriteSinkInner,
+}
+
+enum VolumeFsWriteSinkInner {
+    File(tokio::fs::File),
+    Cloud {
+        buffer: Arc<Mutex<Vec<u8>>>,
+        close: Option<
+            Box<dyn FnOnce(Vec<u8>) -> BoxFuture<'static, MicrosandboxResult<()>> + Send + Sync>,
+        >,
+    },
 }
 
 impl VolumeFsWriteSink {
     /// Construct from an already-opened file. Local impl only.
     pub(crate) fn from_file(file: tokio::fs::File) -> Self {
-        Self { file }
+        Self {
+            inner: VolumeFsWriteSinkInner::File(file),
+        }
+    }
+
+    /// Construct a cloud-backed write sink that uploads buffered data on close.
+    pub(crate) fn new_cloud(
+        close: impl FnOnce(Vec<u8>) -> BoxFuture<'static, MicrosandboxResult<()>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            inner: VolumeFsWriteSinkInner::Cloud {
+                buffer: Arc::new(Mutex::new(Vec::new())),
+                close: Some(Box::new(close)),
+            },
+        }
     }
 }
 
@@ -120,10 +155,6 @@ impl<'a> VolumeFs<'a> {
 
     /// Read a file with streaming. Returns a [`VolumeFsReadStream`] that
     /// yields chunks of bytes.
-    ///
-    /// Routes through the [`VolumeBackend`](crate::backend::VolumeBackend)
-    /// trait — cloud routes return [`crate::MicrosandboxError::Unsupported`]
-    /// until cloud volumes ship.
     pub async fn read_stream(&self, path: &str) -> MicrosandboxResult<VolumeFsReadStream> {
         self.backend.volumes().fs_read_stream(self.name, path).await
     }
@@ -144,10 +175,6 @@ impl<'a> VolumeFs<'a> {
 
     /// Write to a file with streaming. Returns a [`VolumeFsWriteSink`] that
     /// accepts chunks of bytes. Creates parent directories as needed.
-    ///
-    /// Routes through the [`VolumeBackend`](crate::backend::VolumeBackend)
-    /// trait — cloud routes return [`crate::MicrosandboxError::Unsupported`]
-    /// until cloud volumes ship.
     pub async fn write_stream(&self, path: &str) -> MicrosandboxResult<VolumeFsWriteSink> {
         self.backend
             .volumes()
@@ -221,24 +248,24 @@ impl VolumeFsReadStream {
     ///
     /// Returns `None` at EOF.
     pub async fn recv(&mut self) -> MicrosandboxResult<Option<Bytes>> {
-        let n = self.file.read(&mut self.buf).await?;
-        if n == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(Bytes::copy_from_slice(&self.buf[..n])))
+        match &mut self.inner {
+            VolumeFsReadStreamInner::Single(data) => Ok(data.take()),
+            VolumeFsReadStreamInner::File { file, buf } => {
+                let n = file.read(buf).await?;
+                if n == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(Bytes::copy_from_slice(&buf[..n])))
+                }
+            }
         }
     }
 
     /// Read the remaining file data into a single `Bytes` buffer.
     pub async fn collect(mut self) -> MicrosandboxResult<Bytes> {
         let mut data = Vec::new();
-        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
-        loop {
-            let n = self.file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
+        while let Some(chunk) = self.recv().await? {
+            data.extend_from_slice(&chunk);
         }
         Ok(Bytes::from(data))
     }
@@ -251,14 +278,38 @@ impl VolumeFsReadStream {
 impl VolumeFsWriteSink {
     /// Write a chunk of data to the file.
     pub async fn write(&mut self, data: impl AsRef<[u8]>) -> MicrosandboxResult<()> {
-        self.file.write_all(data.as_ref()).await?;
-        Ok(())
+        match &mut self.inner {
+            VolumeFsWriteSinkInner::File(file) => {
+                file.write_all(data.as_ref()).await?;
+                Ok(())
+            }
+            VolumeFsWriteSinkInner::Cloud { buffer, .. } => {
+                buffer.lock().await.extend_from_slice(data.as_ref());
+                Ok(())
+            }
+        }
     }
 
     /// Flush and close the file.
     pub async fn close(mut self) -> MicrosandboxResult<()> {
-        self.file.flush().await?;
-        Ok(())
+        match &mut self.inner {
+            VolumeFsWriteSinkInner::File(file) => {
+                file.flush().await?;
+                Ok(())
+            }
+            VolumeFsWriteSinkInner::Cloud { buffer, close } => {
+                let data = {
+                    let mut guard = buffer.lock().await;
+                    std::mem::take(&mut *guard)
+                };
+                let close = close.take().ok_or_else(|| {
+                    crate::MicrosandboxError::SandboxFsOps(
+                        "cloud volume write stream already closed".into(),
+                    )
+                })?;
+                close(data).await
+            }
+        }
     }
 }
 

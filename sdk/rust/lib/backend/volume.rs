@@ -7,8 +7,8 @@
 //! inside each backend's trait impl and wrapped with the `Arc<dyn Backend>`
 //! the caller passes in.
 //!
-//! Cloud-side volume ops route to `Unsupported` until Phase 6 — see the plan's
-//! D14 table.
+//! Cloud-side volume ops route through the configured msb-cloud-compatible HTTP
+//! backend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,8 +55,6 @@ pub struct VolumeLocalState {
 }
 
 /// Cloud msb-cloud-backed volume state held inside [`VolumeInner::Cloud`].
-///
-/// Placeholder shape — populated when cloud volumes ship in Phase 6.
 pub struct VolumeCloudState {
     /// Server-side UUID.
     pub id: String,
@@ -107,8 +105,6 @@ pub struct VolumeHandleLocalState {
 }
 
 /// Cloud handle state. Captures the snapshot msb-cloud returned at fetch time.
-///
-/// Placeholder shape — populated when cloud volumes ship in Phase 6.
 #[derive(Clone)]
 pub struct VolumeHandleCloudState {
     /// Server-side UUID.
@@ -140,9 +136,7 @@ pub struct VolumeHandleCloudState {
 /// resolve the backend via [`default_backend`](super::default_backend) and
 /// forward it through.
 ///
-/// Cloud-side `fs_*` ops ultimately route through msb-cloud HTTP per the plan's
-/// D9, but in this commit cloud returns [`MicrosandboxError::Unsupported`] for
-/// every method — cloud volumes ship in Phase 6.
+/// Cloud-side `fs_*` ops route through msb-cloud-compatible HTTP.
 pub trait VolumeBackend: Send + Sync {
     /// Create a volume. The returned outer [`Volume`] carries the supplied
     /// `backend` Arc and the variant-specific state inside [`VolumeInner`].
@@ -409,146 +403,163 @@ impl VolumeBackend for LocalBackend {
 impl VolumeBackend for CloudBackend {
     fn create<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
-        _config: VolumeConfig,
+        backend: Arc<dyn Backend>,
+        config: VolumeConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<Volume>> {
-        Box::pin(async move { Err(unsupported("Volume::create")) })
+        Box::pin(async move {
+            let cloud = CloudBackend::create_volume(self, &config).await?;
+            Ok(Volume::from_cloud(backend, cloud))
+        })
     }
 
     fn get<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeHandle>> {
-        Box::pin(async move { Err(unsupported("Volume::get")) })
+        Box::pin(async move {
+            let cloud = CloudBackend::get_volume(self, name).await?;
+            Ok(VolumeHandle::from_cloud(backend, cloud))
+        })
     }
 
     fn list<'a>(
         &'a self,
-        _backend: Arc<dyn Backend>,
+        backend: Arc<dyn Backend>,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<VolumeHandle>>> {
-        Box::pin(async move { Err(unsupported("Volume::list")) })
+        Box::pin(async move {
+            let page = CloudBackend::list_volumes(self, None, None).await?;
+            Ok(page
+                .data
+                .into_iter()
+                .map(|cloud| VolumeHandle::from_cloud(backend.clone(), cloud))
+                .collect())
+        })
     }
 
     fn remove<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("Volume::remove")) })
+        Box::pin(async move {
+            CloudBackend::remove_volume(self, name).await?;
+            Ok(())
+        })
     }
 
     fn fs_read<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read")) })
+        Box::pin(async move { CloudBackend::volume_fs_read(self, name, path).await })
     }
 
     fn fs_read_to_string<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<String>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read_to_string")) })
+        Box::pin(async move {
+            let data = CloudBackend::volume_fs_read(self, name, path).await?;
+            String::from_utf8(Vec::from(data))
+                .map_err(|e| MicrosandboxError::SandboxFsOps(format!("invalid utf-8: {e}")))
+        })
     }
 
     fn fs_write<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
-        _data: Vec<u8>,
+        name: &'a str,
+        path: &'a str,
+        data: Vec<u8>,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::write")) })
+        Box::pin(async move { CloudBackend::volume_fs_write(self, name, path, data).await })
     }
 
     fn fs_list<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::list")) })
+        Box::pin(async move { CloudBackend::volume_fs_list(self, name, path).await })
     }
 
     fn fs_stat<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::stat")) })
+        Box::pin(async move { CloudBackend::volume_fs_stat(self, name, path).await })
     }
 
     fn fs_mkdir<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::mkdir")) })
+        Box::pin(async move { CloudBackend::volume_fs_mkdir(self, name, path).await })
     }
 
     fn fs_remove<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
-        _recursive: bool,
+        name: &'a str,
+        path: &'a str,
+        recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::remove")) })
+        Box::pin(async move { CloudBackend::volume_fs_remove(self, name, path, recursive).await })
     }
 
     fn fs_copy<'a>(
         &'a self,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
+        name: &'a str,
+        from: &'a str,
+        to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::copy")) })
+        Box::pin(async move { CloudBackend::volume_fs_copy(self, name, from, to).await })
     }
 
     fn fs_rename<'a>(
         &'a self,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
+        name: &'a str,
+        from: &'a str,
+        to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::rename")) })
+        Box::pin(async move { CloudBackend::volume_fs_rename(self, name, from, to).await })
     }
 
     fn fs_exists<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::exists")) })
+        Box::pin(async move { CloudBackend::volume_fs_exists(self, name, path).await })
     }
 
     fn fs_read_stream<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeFsReadStream>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::read_stream")) })
+        Box::pin(async move {
+            let data = CloudBackend::volume_fs_read(self, name, path).await?;
+            Ok(VolumeFsReadStream::from_bytes(data))
+        })
     }
 
     fn fs_write_stream<'a>(
         &'a self,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<VolumeFsWriteSink>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::write_stream")) })
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-/// Build a uniform `Unsupported` error for cloud volume ops — all of them are
-/// gated behind Phase 6.
-fn unsupported(feature: &str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud volumes ship".into(),
+        Box::pin(async move {
+            let cloud = self.clone();
+            let name = name.to_string();
+            let path = path.to_string();
+            Ok(VolumeFsWriteSink::new_cloud(move |data| {
+                Box::pin(async move { cloud.volume_fs_write(&name, &path, data).await })
+            }))
+        })
     }
 }
 

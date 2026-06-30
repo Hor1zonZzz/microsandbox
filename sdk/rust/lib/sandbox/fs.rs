@@ -3,17 +3,18 @@
 //! [`SandboxFs`] provides methods to read, write, list, and manipulate files
 //! inside a running sandbox. The handle is a thin façade that dispatches each
 //! op through the [`SandboxBackend`](crate::backend::SandboxBackend) trait, so
-//! local routes through agentd's `core.fs.*` messages and cloud returns
-//! per-method `Unsupported` until cloud guest-fs lands.
+//! local routes through agentd's `core.fs.*` messages and cloud routes through
+//! the configured cloud backend where supported.
 
 use std::{path::Path, sync::Arc};
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use microsandbox_protocol::{
     fs::{FsData, FsEntryInfo, FsOpenOptions, FsResponse},
     message::{Message, MessageType},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -30,7 +31,8 @@ use crate::{
 /// Borrows the parent [`Sandbox`](super::Sandbox)'s `Arc<dyn Backend>` + name
 /// and dispatches each op through the
 /// [`SandboxBackend`](crate::backend::SandboxBackend) trait. Local routes to
-/// `core.fs.*` agent messages; cloud returns `Unsupported` per-method.
+/// `core.fs.*` agent messages; cloud routes through the configured cloud
+/// backend.
 pub struct SandboxFs<'a> {
     backend: Arc<dyn Backend>,
     name: &'a str,
@@ -98,19 +100,38 @@ pub struct FsMetadata {
 
 /// A streaming reader for file data from the sandbox.
 pub struct FsReadStream {
-    rx: mpsc::Receiver<Message>,
-    // Holds the per-call agent client alive for the duration of the stream.
-    // Without this the AgentClient's reader task would be dropped after
-    // `fs_read_stream` returns and `rx` would receive nothing.
-    _client: Option<Arc<AgentClient>>,
+    inner: FsReadStreamInner,
+}
+
+enum FsReadStreamInner {
+    Agent {
+        rx: mpsc::Receiver<Message>,
+        // Holds the per-call agent client alive for the duration of the stream.
+        // Without this the AgentClient's reader task would be dropped after
+        // `fs_read_stream` returns and `rx` would receive nothing.
+        _client: Arc<AgentClient>,
+    },
+    Single(Option<Bytes>),
 }
 
 /// A streaming writer for file data to the sandbox.
 pub struct FsWriteSink {
-    id: u32,
-    client: Arc<AgentClient>,
-    rx: mpsc::Receiver<Message>,
-    close_handle: Option<FsHandle>,
+    inner: FsWriteSinkInner,
+}
+
+enum FsWriteSinkInner {
+    Agent {
+        id: u32,
+        client: Arc<AgentClient>,
+        rx: mpsc::Receiver<Message>,
+        close_handle: Option<FsHandle>,
+    },
+    Cloud {
+        buffer: Arc<Mutex<Vec<u8>>>,
+        close: Option<
+            Box<dyn FnOnce(Vec<u8>) -> BoxFuture<'static, MicrosandboxResult<()>> + Send + Sync>,
+        >,
+    },
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -338,7 +359,8 @@ impl<'a> SandboxFs<'a> {
             .as_local()
             .ok_or_else(|| MicrosandboxError::Unsupported {
                 feature: method.into(),
-                available_when: "when cloud guest-fs lands".into(),
+                available_when: "when cloud exposes extended guest-fs metadata and symlink ops"
+                    .into(),
             })
     }
 }
@@ -352,8 +374,17 @@ impl FsReadStream {
     /// duration of the stream. **Local impl only.**
     pub(crate) fn with_client(rx: mpsc::Receiver<Message>, client: Arc<AgentClient>) -> Self {
         Self {
-            rx,
-            _client: Some(client),
+            inner: FsReadStreamInner::Agent {
+                rx,
+                _client: client,
+            },
+        }
+    }
+
+    /// Construct a read stream from a single in-memory chunk. **Cloud impl only.**
+    pub(crate) fn from_bytes(data: Bytes) -> Self {
+        Self {
+            inner: FsReadStreamInner::Single(Some(data)),
         }
     }
 
@@ -362,27 +393,32 @@ impl FsReadStream {
     /// Returns `None` when the stream is complete (after `FsResponse`).
     /// Returns an error if the guest reported a failure.
     pub async fn recv(&mut self) -> MicrosandboxResult<Option<Bytes>> {
-        while let Some(msg) = self.rx.recv().await {
-            match msg.t {
-                MessageType::FsData => {
-                    let chunk: FsData = msg.payload()?;
-                    if !chunk.data.is_empty() {
-                        return Ok(Some(Bytes::from(chunk.data)));
+        match &mut self.inner {
+            FsReadStreamInner::Single(data) => Ok(data.take()),
+            FsReadStreamInner::Agent { rx, .. } => {
+                while let Some(msg) = rx.recv().await {
+                    match msg.t {
+                        MessageType::FsData => {
+                            let chunk: FsData = msg.payload()?;
+                            if !chunk.data.is_empty() {
+                                return Ok(Some(Bytes::from(chunk.data)));
+                            }
+                        }
+                        MessageType::FsResponse => {
+                            let resp: FsResponse = msg.payload()?;
+                            if !resp.ok {
+                                return Err(MicrosandboxError::SandboxFsOps(
+                                    resp.error.unwrap_or_else(|| "unknown error".into()),
+                                ));
+                            }
+                            return Ok(None);
+                        }
+                        _ => {}
                     }
                 }
-                MessageType::FsResponse => {
-                    let resp: FsResponse = msg.payload()?;
-                    if !resp.ok {
-                        return Err(MicrosandboxError::SandboxFsOps(
-                            resp.error.unwrap_or_else(|| "unknown error".into()),
-                        ));
-                    }
-                    return Ok(None);
-                }
-                _ => {}
+                Ok(None)
             }
         }
-        Ok(None)
     }
 
     /// Collect all remaining data into bytes.
@@ -408,22 +444,47 @@ impl FsWriteSink {
         close_handle: Option<FsHandle>,
     ) -> Self {
         Self {
-            id,
-            client,
-            rx,
-            close_handle,
+            inner: FsWriteSinkInner::Agent {
+                id,
+                client,
+                rx,
+                close_handle,
+            },
+        }
+    }
+
+    /// Construct a cloud-backed write sink that uploads buffered data on close.
+    pub(crate) fn new_cloud(
+        close: impl FnOnce(Vec<u8>) -> BoxFuture<'static, MicrosandboxResult<()>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            inner: FsWriteSinkInner::Cloud {
+                buffer: Arc::new(Mutex::new(Vec::new())),
+                close: Some(Box::new(close)),
+            },
         }
     }
 
     /// Write a chunk of data.
     pub async fn write(&self, data: impl AsRef<[u8]>) -> MicrosandboxResult<()> {
-        let fs_data = FsData {
-            data: data.as_ref().to_vec(),
-        };
-        self.client
-            .send(self.id, MessageType::FsData, &fs_data)
-            .await
-            .map_err(Into::into)
+        match &self.inner {
+            FsWriteSinkInner::Agent { id, client, .. } => {
+                let fs_data = FsData {
+                    data: data.as_ref().to_vec(),
+                };
+                client
+                    .send(*id, MessageType::FsData, &fs_data)
+                    .await
+                    .map_err(Into::into)
+            }
+            FsWriteSinkInner::Cloud { buffer, .. } => {
+                buffer.lock().await.extend_from_slice(data.as_ref());
+                Ok(())
+            }
+        }
     }
 
     /// Close the write stream (sends EOF) and wait for confirmation.
@@ -431,15 +492,34 @@ impl FsWriteSink {
     /// This must be called to finalize the write operation. Returns an
     /// error if the guest reports a write failure.
     pub async fn close(mut self) -> MicrosandboxResult<()> {
-        let eof = FsData { data: Vec::new() };
-        self.client.send(self.id, MessageType::FsData, &eof).await?;
+        match &mut self.inner {
+            FsWriteSinkInner::Agent {
+                id,
+                client,
+                rx,
+                close_handle,
+            } => {
+                let eof = FsData { data: Vec::new() };
+                client.send(*id, MessageType::FsData, &eof).await?;
 
-        // Wait for the terminal FsResponse from the guest.
-        let result = wait_for_ok_response(&mut self.rx).await;
-        if let Some(handle) = self.close_handle.take() {
-            let _ = local::close_handle(&self.client, handle).await;
+                // Wait for the terminal FsResponse from the guest.
+                let result = wait_for_ok_response(rx).await;
+                if let Some(handle) = close_handle.take() {
+                    let _ = local::close_handle(client, handle).await;
+                }
+                result
+            }
+            FsWriteSinkInner::Cloud { buffer, close } => {
+                let data = {
+                    let mut guard = buffer.lock().await;
+                    std::mem::take(&mut *guard)
+                };
+                let close = close.take().ok_or_else(|| {
+                    MicrosandboxError::SandboxFsOps("cloud write stream already closed".into())
+                })?;
+                close(data).await
+            }
         }
-        result
     }
 }
 

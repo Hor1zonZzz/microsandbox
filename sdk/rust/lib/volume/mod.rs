@@ -2,8 +2,8 @@
 //!
 //! Volumes are persistent named storage. Locally they are host-side
 //! directories under `~/.microsandbox/volumes/<name>/` with metadata tracked
-//! in SQLite. Cloud-side they ultimately live in the org's S3 namespace via
-//! msb-cloud (Phase 6; today every cloud op returns `Unsupported`).
+//! in SQLite. Cloud-side they are routed through the active msb-cloud-compatible
+//! backend.
 //!
 //! Per the SDK local-cloud parity plan (D6.4) [`Volume`] and [`VolumeHandle`]
 //! stay single types regardless of backend. Each holds an
@@ -26,8 +26,8 @@ use sea_orm::ConnectionTrait;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
 use crate::backend::{
-    Backend, BackendKind, LocalBackend, VolumeHandleInner, VolumeHandleLocalState, VolumeInner,
-    VolumeLocalState,
+    Backend, BackendKind, LocalBackend, VolumeCloudState, VolumeHandleCloudState,
+    VolumeHandleInner, VolumeHandleLocalState, VolumeInner, VolumeLocalState,
 };
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -134,6 +134,26 @@ impl Volume {
             name,
         }
     }
+
+    /// Build an outer `Volume` from cloud-variant response state.
+    pub(crate) fn from_cloud(
+        backend: Arc<dyn Backend>,
+        cloud: microsandbox_types::CloudVolume,
+    ) -> Self {
+        let name = cloud.name.clone();
+        Self {
+            backend,
+            inner: Arc::new(VolumeInner::Cloud(VolumeCloudState {
+                id: cloud.id,
+                org_id: cloud.org_id,
+                kind: cloud.kind,
+                capacity_bytes: cloud.capacity_bytes,
+                disk_format: cloud.disk_format,
+                disk_fstype: cloud.disk_fstype,
+            })),
+            name,
+        }
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -226,8 +246,8 @@ impl Volume {
     /// Operate on the volume's filesystem (read, write, list files) without
     /// needing a running sandbox.
     ///
-    /// Routes through the backend trait — local ops hit `tokio::fs`, cloud
-    /// ops will route through msb-cloud HTTP once Phase 6 lands.
+    /// Routes through the backend trait — local ops hit `tokio::fs`, cloud ops
+    /// go through the configured msb-cloud-compatible HTTP backend.
     pub fn fs(&self) -> VolumeFs<'_> {
         VolumeFs::new(self.backend.clone(), &self.name)
     }
@@ -275,6 +295,30 @@ impl VolumeHandle {
                 disk_fstype: model.disk_fstype,
                 labels,
                 created_at: model.created_at.map(|dt| dt.and_utc()),
+            }),
+            name,
+        }
+    }
+
+    /// Build a handle from a cloud volume response.
+    pub(crate) fn from_cloud(
+        backend: Arc<dyn Backend>,
+        cloud: microsandbox_types::CloudVolume,
+    ) -> Self {
+        let name = cloud.name.clone();
+        Self {
+            backend,
+            inner: VolumeHandleInner::Cloud(VolumeHandleCloudState {
+                id: cloud.id,
+                org_id: cloud.org_id,
+                quota_mib: cloud.quota_mib,
+                kind: cloud.kind,
+                used_bytes: cloud.used_bytes,
+                capacity_bytes: cloud.capacity_bytes,
+                disk_format: cloud.disk_format,
+                disk_fstype: cloud.disk_fstype,
+                labels: cloud.labels,
+                created_at: cloud.created_at,
             }),
             name,
         }

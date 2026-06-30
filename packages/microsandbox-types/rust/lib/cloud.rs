@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::VolumeKind;
+
 //--------------------------------------------------------------------------------------------------
 // Types: Request
 //--------------------------------------------------------------------------------------------------
@@ -130,6 +132,171 @@ pub struct CloudPaginated<T> {
 pub struct CloudMessageResponse {
     /// Human-readable response message.
     pub message: String,
+}
+
+/// Wire shape of a sandbox metrics sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudSandboxMetrics {
+    /// CPU usage as a percentage across all host CPUs.
+    pub cpu_percent: f32,
+    /// Cumulative guest vCPU execution time across all vCPUs.
+    pub vcpu_time_ns: u64,
+    /// Resident memory usage in bytes.
+    pub memory_bytes: u64,
+    /// Guest-available memory in bytes when reported by the guest.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub memory_available_bytes: Option<u64>,
+    /// Host-resident guest memory in bytes for capacity diagnostics.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub memory_host_resident_bytes: Option<u64>,
+    /// Configured guest memory limit in bytes.
+    pub memory_limit_bytes: u64,
+    /// Cumulative disk bytes read by the sandbox process.
+    pub disk_read_bytes: u64,
+    /// Cumulative disk bytes written by the sandbox process.
+    pub disk_write_bytes: u64,
+    /// Cumulative network bytes delivered from the runtime to the guest.
+    pub net_rx_bytes: u64,
+    /// Cumulative network bytes transmitted from the guest into the runtime.
+    pub net_tx_bytes: u64,
+    /// Guest-visible OCI upper filesystem used bytes when available.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub upper_used_bytes: Option<u64>,
+    /// Guest-visible OCI upper filesystem free bytes when available.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub upper_free_bytes: Option<u64>,
+    /// Host-allocated bytes for the writable upper image when available.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub upper_host_allocated_bytes: Option<u64>,
+    /// Sandbox uptime in milliseconds.
+    pub uptime_ms: u64,
+    /// Timestamp of the sample.
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Wire shape of a guest filesystem entry kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum CloudFsEntryKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+    /// Symbolic link.
+    Symlink,
+    /// Other filesystem node type.
+    Other,
+}
+
+/// Wire shape of a guest filesystem directory entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudFsEntry {
+    /// Path of the entry.
+    pub path: String,
+    /// Kind of entry.
+    pub kind: CloudFsEntryKind,
+    /// Size in bytes.
+    pub size: u64,
+    /// Unix permission bits.
+    pub mode: u32,
+    /// Last modification time.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub modified: Option<DateTime<Utc>>,
+}
+
+/// Wire shape of guest filesystem metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudFsMetadata {
+    /// Kind of entry.
+    pub kind: CloudFsEntryKind,
+    /// Size in bytes.
+    pub size: u64,
+    /// Unix permission bits.
+    pub mode: u32,
+    /// Whether the entry is read-only.
+    pub readonly: bool,
+    /// Last modification time.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub modified: Option<DateTime<Utc>>,
+    /// Creation time.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// Wire shape of a guest path existence response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudFsExistsResponse {
+    /// Whether the path exists.
+    pub exists: bool,
+}
+
+/// Wire shape of a single guest path mutation request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudFsPathRequest {
+    /// Guest path.
+    pub path: String,
+}
+
+/// Wire shape of a guest copy/rename request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudFsTwoPathRequest {
+    /// Source guest path.
+    pub from: String,
+    /// Destination guest path.
+    pub to: String,
+}
+
+/// Wire shape of a cloud volume response returned by volume endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CloudVolume {
+    /// Server-side UUID.
+    pub id: String,
+    /// Owning org's UUID.
+    pub org_id: String,
+    /// User-facing volume name.
+    pub name: String,
+    /// Storage kind.
+    pub kind: VolumeKind,
+    /// Configured quota in MiB, when set.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub quota_mib: Option<u32>,
+    /// Disk usage snapshot at handle-fetch time.
+    pub used_bytes: u64,
+    /// Disk capacity in bytes for disk volumes.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub capacity_bytes: Option<u64>,
+    /// Disk image format for disk volumes.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub disk_format: Option<String>,
+    /// Inner disk filesystem for disk volumes.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub disk_fstype: Option<String>,
+    /// Key-value labels associated with the volume.
+    pub labels: Vec<(String, String)>,
+    /// Creation timestamp.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Wire shape of the typed error body returned by cloud APIs on 4xx/5xx responses.

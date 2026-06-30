@@ -3,13 +3,14 @@
 use ts_rs::TS;
 
 use crate::{
-    CloudCreateSandboxRequest, CloudErrorBody, CloudErrorDetails, CloudMessageResponse,
-    CloudPaginated, CloudSandbox, CloudSandboxStatus, DiskImageFormat, EnvVar, HandoffInit,
-    HostPermissions, LogSource, MountOptions, NamedVolumeCreate, NamedVolumeMode, NetworkSpec,
-    OciRootfsSource, Patch, PortProtocol, PublishedPortSpec, PullPolicy, Rlimit, RlimitResource,
-    RootfsSource, SandboxLogLevel, SandboxPolicy, SandboxResources, SandboxRuntimeOptions,
-    SandboxSpec, SecurityProfile, SnapshotDestination, SnapshotSpec, StatVirtualization,
-    VolumeKind, VolumeMount, VolumeSpec,
+    CloudCreateSandboxRequest, CloudErrorBody, CloudErrorDetails, CloudFsEntry, CloudFsEntryKind,
+    CloudFsExistsResponse, CloudFsMetadata, CloudFsPathRequest, CloudFsTwoPathRequest,
+    CloudMessageResponse, CloudPaginated, CloudSandbox, CloudSandboxMetrics, CloudSandboxStatus,
+    CloudVolume, DiskImageFormat, EnvVar, HandoffInit, HostPermissions, LogSource, MountOptions,
+    NamedVolumeCreate, NamedVolumeMode, NetworkSpec, OciRootfsSource, Patch, PortProtocol,
+    PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootfsSource, SandboxLogLevel,
+    SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec, SecurityProfile,
+    SnapshotDestination, SnapshotSpec, StatVirtualization, VolumeKind, VolumeMount, VolumeSpec,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -77,6 +78,14 @@ pub fn declarations() -> Vec<String> {
         CloudSandboxStatus::decl(&cfg),
         CloudPaginated::<CloudSandbox>::decl(&cfg),
         CloudMessageResponse::decl(&cfg),
+        CloudSandboxMetrics::decl(&cfg),
+        CloudFsEntryKind::decl(&cfg),
+        CloudFsEntry::decl(&cfg),
+        CloudFsMetadata::decl(&cfg),
+        CloudFsExistsResponse::decl(&cfg),
+        CloudFsPathRequest::decl(&cfg),
+        CloudFsTwoPathRequest::decl(&cfg),
+        CloudVolume::decl(&cfg),
         CloudErrorBody::decl(&cfg),
         CloudErrorDetails::decl(&cfg),
     ]
@@ -134,7 +143,7 @@ mod tests {
     fn ts_rs_renders_cloud_contract_declarations() {
         let declarations = declarations();
 
-        assert_eq!(declarations.len(), 37);
+        assert_eq!(declarations.len(), 45);
         assert!(
             declarations
                 .iter()

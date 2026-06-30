@@ -21,7 +21,7 @@ use super::{Backend, CloudBackend, LocalBackend};
 use crate::agent::AgentClient;
 use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::{ProcessHandle, SpawnMode};
-use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
+use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput, StdinMode};
 use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
 use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{
@@ -843,26 +843,22 @@ impl SandboxBackend for CloudBackend {
     fn kill<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
-            Err(unsupported(
-                "cloud sandbox kill",
-                "when cloud forced-stop lands",
-            ))
+            CloudBackend::kill_sandbox(self, name).await?;
+            Ok(())
         })
     }
 
     fn drain<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
-            Err(unsupported(
-                "cloud sandbox drain",
-                "when cloud graceful-drain lands",
-            ))
+            CloudBackend::drain_sandbox(self, name).await?;
+            Ok(())
         })
     }
 
@@ -880,23 +876,37 @@ impl SandboxBackend for CloudBackend {
     fn exec_stream<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _config: &'a SandboxConfig,
-        _cmd: String,
-        _opts: ExecOptions,
+        name: &'a str,
+        config: &'a SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>> {
-        Box::pin(async move { Err(unsupported_exec("Sandbox::exec_stream")) })
+        Box::pin(async move { CloudBackend::exec_stream(self, name, config, cmd, opts).await })
     }
 
     fn attach<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _config: &'a SandboxConfig,
-        _cmd: String,
-        _opts: crate::sandbox::AttachOptionsBuilder,
+        name: &'a str,
+        config: &'a SandboxConfig,
+        cmd: String,
+        opts: crate::sandbox::AttachOptionsBuilder,
     ) -> BoxFuture<'a, MicrosandboxResult<i32>> {
-        Box::pin(async move { Err(unsupported_exec("Sandbox::attach")) })
+        Box::pin(async move {
+            let opts = opts.build()?;
+            let exec_opts = ExecOptions {
+                args: opts.args,
+                cwd: opts.cwd,
+                user: opts.user,
+                env: opts.env,
+                stdin: StdinMode::Pipe,
+                tty: true,
+                rlimits: opts.rlimits,
+                ..Default::default()
+            };
+            let handle = CloudBackend::exec_stream(self, name, config, cmd, exec_opts).await?;
+            crate::sandbox::attach::attach_exec_handle(handle, opts.detach_keys).await
+        })
     }
 
     fn logs<'a>(
@@ -920,145 +930,173 @@ impl SandboxBackend for CloudBackend {
     fn metrics<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
+        name: &'a str,
         _config: &'a SandboxConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxMetrics>> {
-        Box::pin(async move { Err(unsupported_metrics("Sandbox::metrics")) })
+        Box::pin(async move { CloudBackend::metrics(self, name).await })
     }
 
     fn metrics_stream(
         &self,
         _backend: Arc<dyn Backend>,
-        _name: String,
+        name: String,
         _config: SandboxConfig,
-        _interval: Duration,
+        interval: Duration,
     ) -> MetricsStream {
-        Box::pin(futures::stream::once(async {
-            Err(unsupported_metrics("Sandbox::metrics_stream"))
-        }))
+        let cloud = self.clone();
+        let interval = if interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            interval
+        };
+        Box::pin(futures::stream::unfold(
+            (tokio::time::interval(interval), cloud, name),
+            |(mut ticker, cloud, name)| async move {
+                ticker.tick().await;
+                let item = CloudBackend::metrics(&cloud, &name).await;
+                Some((item, (ticker, cloud, name)))
+            },
+        ))
     }
 
     fn fs_read<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::read")) })
+        Box::pin(async move { CloudBackend::fs_read(self, name, path).await })
     }
 
     fn fs_read_stream<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::read_stream")) })
+        Box::pin(async move {
+            let data = CloudBackend::fs_read(self, name, path).await?;
+            Ok(FsReadStream::from_bytes(data))
+        })
     }
 
     fn fs_write<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-        _data: Vec<u8>,
+        name: &'a str,
+        path: &'a str,
+        data: Vec<u8>,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::write")) })
+        Box::pin(async move { CloudBackend::fs_write(self, name, path, data).await })
     }
 
     fn fs_write_stream<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsWriteSink>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::write_stream")) })
+        Box::pin(async move {
+            let cloud = self.clone();
+            let name = name.to_string();
+            let path = path.to_string();
+            Ok(FsWriteSink::new_cloud(move |data| {
+                Box::pin(async move { CloudBackend::fs_write(&cloud, &name, &path, data).await })
+            }))
+        })
     }
 
     fn fs_list<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::list")) })
+        Box::pin(async move { CloudBackend::fs_list(self, name, path).await })
     }
 
     fn fs_stat<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::stat")) })
+        Box::pin(async move { CloudBackend::fs_stat(self, name, path).await })
     }
 
     fn fs_mkdir<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::mkdir")) })
+        Box::pin(async move { CloudBackend::fs_mkdir(self, name, path).await })
     }
 
     fn fs_remove<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
-        _recursive: bool,
+        name: &'a str,
+        path: &'a str,
+        recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::remove")) })
+        Box::pin(async move { CloudBackend::fs_remove(self, name, path, recursive).await })
     }
 
     fn fs_copy<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
+        name: &'a str,
+        from: &'a str,
+        to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::copy")) })
+        Box::pin(async move { CloudBackend::fs_copy(self, name, from, to).await })
     }
 
     fn fs_rename<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _from: &'a str,
-        _to: &'a str,
+        name: &'a str,
+        from: &'a str,
+        to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::rename")) })
+        Box::pin(async move { CloudBackend::fs_rename(self, name, from, to).await })
     }
 
     fn fs_exists<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _path: &'a str,
+        name: &'a str,
+        path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::exists")) })
+        Box::pin(async move { CloudBackend::fs_exists(self, name, path).await })
     }
 
     fn fs_copy_from_host<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _host: &'a Path,
-        _guest: &'a str,
+        name: &'a str,
+        host: &'a Path,
+        guest: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::copy_from_host")) })
+        Box::pin(async move {
+            let data = tokio::fs::read(host).await?;
+            CloudBackend::fs_write(self, name, guest, data).await
+        })
     }
 
     fn fs_copy_to_host<'a>(
         &'a self,
         _backend: Arc<dyn Backend>,
-        _name: &'a str,
-        _guest: &'a str,
-        _host: &'a Path,
+        name: &'a str,
+        guest: &'a str,
+        host: &'a Path,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported_fs("SandboxFs::copy_to_host")) })
+        Box::pin(async move {
+            let data = CloudBackend::fs_read(self, name, guest).await?;
+            tokio::fs::write(host, data).await?;
+            Ok(())
+        })
     }
 }
 
@@ -1266,27 +1304,6 @@ fn unsupported(feature: &'static str, available_when: &'static str) -> Microsand
     MicrosandboxError::Unsupported {
         feature: feature.into(),
         available_when: available_when.into(),
-    }
-}
-
-fn unsupported_exec(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud exec lands".into(),
-    }
-}
-
-fn unsupported_fs(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud guest fs lands".into(),
-    }
-}
-
-fn unsupported_metrics(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud metrics land".into(),
     }
 }
 

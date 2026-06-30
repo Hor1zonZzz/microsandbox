@@ -4,7 +4,7 @@ use microsandbox_types::EnvVar;
 
 use crate::MicrosandboxResult;
 
-use super::exec::Rlimit;
+use super::exec::{ExecEvent, ExecHandle, Rlimit};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -240,6 +240,115 @@ pub(crate) fn input_contains_detach_sequence(
     }
 
     false
+}
+
+#[cfg(unix)]
+pub(crate) async fn attach_exec_handle(
+    mut handle: ExecHandle,
+    detach_keys: Option<String>,
+) -> MicrosandboxResult<i32> {
+    use std::os::fd::AsRawFd;
+
+    use tokio::io::{AsyncWriteExt, unix::AsyncFd};
+
+    use crate::sandbox::{open_nonblocking_terminal_input, read_from_fd, terminal_path_for_fd};
+
+    let detach_keys = match detach_keys {
+        Some(spec) => DetachKeys::parse(&spec)?,
+        None => DetachKeys::default_keys(),
+    };
+
+    crossterm::terminal::enable_raw_mode()
+        .map_err(|e| crate::MicrosandboxError::Terminal(e.to_string()))?;
+    let _raw_guard = scopeguard::guard((), |_| {
+        let _ = crossterm::terminal::disable_raw_mode();
+    });
+
+    let tty_input_path = terminal_path_for_fd(std::io::stdin().as_raw_fd())
+        .map_err(|e| crate::MicrosandboxError::Terminal(format!("resolve tty path: {e}")))?;
+    let tty_input = open_nonblocking_terminal_input(&tty_input_path)
+        .map_err(|e| crate::MicrosandboxError::Terminal(format!("open tty input: {e}")))?;
+    let stdin_async = AsyncFd::new(tty_input)
+        .map_err(|e| crate::MicrosandboxError::Terminal(format!("async tty input: {e}")))?;
+
+    let stdin = handle.take_stdin().ok_or_else(|| {
+        crate::MicrosandboxError::Runtime("attach exec handle has no stdin sink".into())
+    })?;
+    let mut stdout = tokio::io::stdout();
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .map_err(|e| crate::MicrosandboxError::Runtime(format!("sigwinch: {e}")))?;
+
+    let detach_seq = detach_keys.sequence();
+    let mut match_pos = 0usize;
+    let mut exit_code = -1;
+
+    loop {
+        tokio::select! {
+            result = stdin_async.readable() => {
+                let mut guard = match result {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+
+                let mut input_buf = [0u8; 1024];
+                match guard.try_io(|inner| {
+                    read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buf)
+                }) {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        let data = &input_buf[..n];
+                        if input_contains_detach_sequence(data, detach_seq, &mut match_pos) {
+                            break;
+                        }
+                        if stdin.write(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(_)) => break,
+                    Err(_would_block) => continue,
+                }
+            }
+
+            event = handle.recv() => {
+                match event {
+                    Some(ExecEvent::Stdout(data)) | Some(ExecEvent::Stderr(data)) => {
+                        let _ = stdout.write_all(&data).await;
+                        let _ = stdout.flush().await;
+                    }
+                    Some(ExecEvent::Exited { code }) => {
+                        exit_code = code;
+                        break;
+                    }
+                    Some(ExecEvent::Failed(failed)) => {
+                        return Err(crate::MicrosandboxError::ExecFailed(failed));
+                    }
+                    Some(ExecEvent::Started { .. }) | Some(ExecEvent::StdinError(_)) => {}
+                    None => break,
+                }
+            }
+
+            _ = sigwinch.recv() => {
+                if let Ok((new_cols, new_rows)) = crossterm::terminal::size() {
+                    let _ = handle.resize(new_rows, new_cols).await;
+                }
+            }
+        }
+    }
+
+    Ok(exit_code)
+}
+
+#[cfg(windows)]
+pub(crate) async fn attach_exec_handle(
+    _handle: ExecHandle,
+    _detach_keys: Option<String>,
+) -> MicrosandboxResult<i32> {
+    Err(crate::MicrosandboxError::Unsupported {
+        feature: "Sandbox::attach on cloud for Windows".into(),
+        available_when: "when the Windows terminal event pump is generalized for cloud exec".into(),
+    })
 }
 
 //--------------------------------------------------------------------------------------------------

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, stream};
+use futures::{Sink, SinkExt, Stream, StreamExt, stream};
 use microsandbox_protocol::{
     codec,
     exec::{ExecExited, ExecFailed, ExecStarted, ExecStderr, ExecStdin, ExecStdout},
@@ -41,12 +41,15 @@ use tokio_tungstenite::{
 use super::{Backend, BackendKind, SandboxBackend, VolumeBackend, sandbox::LogStream};
 use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
 use crate::sandbox::{
-    SandboxConfig, build_exec_request,
-    exec::{ExecOptions, ExecOutput, ExitStatus, StdinMode},
+    FsEntry, FsEntryKind, FsMetadata, SandboxConfig, SandboxMetrics, build_exec_request,
+    exec::{ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode},
 };
+use crate::volume::VolumeConfig;
 use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_types::{
-    CloudCreateSandboxRequest, CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox,
+    CloudCreateSandboxRequest, CloudErrorBody, CloudFsEntry, CloudFsEntryKind,
+    CloudFsExistsResponse, CloudFsMetadata, CloudFsPathRequest, CloudFsTwoPathRequest,
+    CloudMessageResponse, CloudPaginated, CloudSandbox, CloudSandboxMetrics, CloudVolume,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -79,6 +82,7 @@ fn default_user_agent() -> String {
 /// - [`CloudBackend::from_profile`] — reads a named profile from the SDK config.
 /// - [`CloudBackend::builder`] — tuned construction (custom client, timeout,
 ///   user agent).
+#[derive(Clone)]
 pub struct CloudBackend {
     url: String,
     api_key: String,
@@ -278,6 +282,40 @@ impl CloudBackend {
         decode_json(resp, "POST /v1/sandboxes/by-name/:name/stop").await
     }
 
+    /// `POST /v1/sandboxes/by-name/:name/kill`.
+    pub async fn kill_sandbox(&self, name: &str) -> MicrosandboxResult<CloudSandbox> {
+        let url = format!(
+            "{}/v1/sandboxes/by-name/{}/kill",
+            self.url,
+            urlencoding(name)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST kill", e))?;
+        decode_json(resp, "POST /v1/sandboxes/by-name/:name/kill").await
+    }
+
+    /// `POST /v1/sandboxes/by-name/:name/drain`.
+    pub async fn drain_sandbox(&self, name: &str) -> MicrosandboxResult<CloudSandbox> {
+        let url = format!(
+            "{}/v1/sandboxes/by-name/{}/drain",
+            self.url,
+            urlencoding(name)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST drain", e))?;
+        decode_json(resp, "POST /v1/sandboxes/by-name/:name/drain").await
+    }
+
     /// `DELETE /v1/sandboxes/by-name/:name`. Returns the typed `MessageResponse`
     /// msb-cloud emits.
     pub async fn destroy_sandbox(&self, name: &str) -> MicrosandboxResult<CloudMessageResponse> {
@@ -321,6 +359,446 @@ impl CloudBackend {
         })
     }
 
+    /// Get a point-in-time metrics sample from `GET /v1/sandboxes/:id/metrics`.
+    pub async fn metrics(&self, name: &str) -> MicrosandboxResult<SandboxMetrics> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/metrics",
+            self.url,
+            urlencoding(&sandbox.id)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/metrics", e))?;
+        let metrics: CloudSandboxMetrics =
+            decode_json(resp, "GET /v1/sandboxes/:id/metrics").await?;
+        Ok(sandbox_metrics_from_cloud(metrics))
+    }
+
+    /// Read an entire guest file from `GET /v1/sandboxes/:id/fs/read`.
+    pub async fn fs_read(&self, name: &str, path: &str) -> MicrosandboxResult<Bytes> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/read?path={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/fs/read", e))?;
+        decode_bytes(resp, "GET /v1/sandboxes/:id/fs/read").await
+    }
+
+    /// Write an entire guest file via `PUT /v1/sandboxes/:id/fs/write`.
+    pub async fn fs_write(&self, name: &str, path: &str, data: Vec<u8>) -> MicrosandboxResult<()> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/write?path={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("PUT /v1/sandboxes/:id/fs/write", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "PUT /v1/sandboxes/:id/fs/write").await?;
+        Ok(())
+    }
+
+    /// List immediate children of a guest directory.
+    pub async fn fs_list(&self, name: &str, path: &str) -> MicrosandboxResult<Vec<FsEntry>> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/list?path={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/fs/list", e))?;
+        let entries: Vec<CloudFsEntry> = decode_json(resp, "GET /v1/sandboxes/:id/fs/list").await?;
+        Ok(entries.into_iter().map(fs_entry_from_cloud).collect())
+    }
+
+    /// Stat a guest path.
+    pub async fn fs_stat(&self, name: &str, path: &str) -> MicrosandboxResult<FsMetadata> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/stat?path={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/fs/stat", e))?;
+        let metadata: CloudFsMetadata = decode_json(resp, "GET /v1/sandboxes/:id/fs/stat").await?;
+        Ok(fs_metadata_from_cloud(metadata))
+    }
+
+    /// Create a guest directory and parents.
+    pub async fn fs_mkdir(&self, name: &str, path: &str) -> MicrosandboxResult<()> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/mkdir",
+            self.url,
+            urlencoding(&sandbox.id)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsPathRequest { path: path.into() })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/sandboxes/:id/fs/mkdir", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/sandboxes/:id/fs/mkdir").await?;
+        Ok(())
+    }
+
+    /// Remove a guest file or directory.
+    pub async fn fs_remove(
+        &self,
+        name: &str,
+        path: &str,
+        recursive: bool,
+    ) -> MicrosandboxResult<()> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs?path={}&recursive={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path),
+            recursive
+        );
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("DELETE /v1/sandboxes/:id/fs", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "DELETE /v1/sandboxes/:id/fs").await?;
+        Ok(())
+    }
+
+    /// Copy a guest path.
+    pub async fn fs_copy(&self, name: &str, from: &str, to: &str) -> MicrosandboxResult<()> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/copy",
+            self.url,
+            urlencoding(&sandbox.id)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsTwoPathRequest {
+                from: from.into(),
+                to: to.into(),
+            })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/sandboxes/:id/fs/copy", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/sandboxes/:id/fs/copy").await?;
+        Ok(())
+    }
+
+    /// Rename a guest path.
+    pub async fn fs_rename(&self, name: &str, from: &str, to: &str) -> MicrosandboxResult<()> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/rename",
+            self.url,
+            urlencoding(&sandbox.id)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsTwoPathRequest {
+                from: from.into(),
+                to: to.into(),
+            })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/sandboxes/:id/fs/rename", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/sandboxes/:id/fs/rename").await?;
+        Ok(())
+    }
+
+    /// Check whether a guest path exists.
+    pub async fn fs_exists(&self, name: &str, path: &str) -> MicrosandboxResult<bool> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = format!(
+            "{}/v1/sandboxes/{}/fs/exists?path={}",
+            self.url,
+            urlencoding(&sandbox.id),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/fs/exists", e))?;
+        let body: CloudFsExistsResponse =
+            decode_json(resp, "GET /v1/sandboxes/:id/fs/exists").await?;
+        Ok(body.exists)
+    }
+
+    /// `POST /v1/volumes`.
+    pub async fn create_volume(&self, config: &VolumeConfig) -> MicrosandboxResult<CloudVolume> {
+        let url = format!("{}/v1/volumes", self.url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(config)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/volumes", e))?;
+        decode_json(resp, "POST /v1/volumes").await
+    }
+
+    /// `GET /v1/volumes`.
+    pub async fn list_volumes(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> MicrosandboxResult<CloudPaginated<CloudVolume>> {
+        let mut url = format!("{}/v1/volumes", self.url);
+        let mut query = Vec::new();
+        if let Some(c) = cursor {
+            query.push(format!("cursor={}", urlencoding(c)));
+        }
+        if let Some(l) = limit {
+            query.push(format!("limit={l}"));
+        }
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes", e))?;
+        decode_json(resp, "GET /v1/volumes").await
+    }
+
+    /// `GET /v1/volumes/:name`.
+    pub async fn get_volume(&self, name: &str) -> MicrosandboxResult<CloudVolume> {
+        let url = format!("{}/v1/volumes/{}", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes/:name", e))?;
+        decode_json(resp, "GET /v1/volumes/:name").await
+    }
+
+    /// `DELETE /v1/volumes/:name`.
+    pub async fn remove_volume(&self, name: &str) -> MicrosandboxResult<CloudMessageResponse> {
+        let url = format!("{}/v1/volumes/{}", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("DELETE /v1/volumes/:name", e))?;
+        decode_json(resp, "DELETE /v1/volumes/:name").await
+    }
+
+    /// Read a volume file from `GET /v1/volumes/:name/fs/read`.
+    pub async fn volume_fs_read(&self, name: &str, path: &str) -> MicrosandboxResult<Bytes> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs/read?path={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes/:name/fs/read", e))?;
+        decode_bytes(resp, "GET /v1/volumes/:name/fs/read").await
+    }
+
+    /// Write a volume file via `PUT /v1/volumes/:name/fs/write`.
+    pub async fn volume_fs_write(
+        &self,
+        name: &str,
+        path: &str,
+        data: Vec<u8>,
+    ) -> MicrosandboxResult<()> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs/write?path={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("PUT /v1/volumes/:name/fs/write", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "PUT /v1/volumes/:name/fs/write").await?;
+        Ok(())
+    }
+
+    /// List immediate children of a volume directory.
+    pub async fn volume_fs_list(&self, name: &str, path: &str) -> MicrosandboxResult<Vec<FsEntry>> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs/list?path={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes/:name/fs/list", e))?;
+        let entries: Vec<CloudFsEntry> = decode_json(resp, "GET /v1/volumes/:name/fs/list").await?;
+        Ok(entries.into_iter().map(fs_entry_from_cloud).collect())
+    }
+
+    /// Stat a volume path.
+    pub async fn volume_fs_stat(&self, name: &str, path: &str) -> MicrosandboxResult<FsMetadata> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs/stat?path={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes/:name/fs/stat", e))?;
+        let metadata: CloudFsMetadata = decode_json(resp, "GET /v1/volumes/:name/fs/stat").await?;
+        Ok(fs_metadata_from_cloud(metadata))
+    }
+
+    /// Create a volume directory and parents.
+    pub async fn volume_fs_mkdir(&self, name: &str, path: &str) -> MicrosandboxResult<()> {
+        let url = format!("{}/v1/volumes/{}/fs/mkdir", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsPathRequest { path: path.into() })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/volumes/:name/fs/mkdir", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/volumes/:name/fs/mkdir").await?;
+        Ok(())
+    }
+
+    /// Remove a volume file or directory.
+    pub async fn volume_fs_remove(
+        &self,
+        name: &str,
+        path: &str,
+        recursive: bool,
+    ) -> MicrosandboxResult<()> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs?path={}&recursive={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path),
+            recursive
+        );
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("DELETE /v1/volumes/:name/fs", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "DELETE /v1/volumes/:name/fs").await?;
+        Ok(())
+    }
+
+    /// Copy a volume path.
+    pub async fn volume_fs_copy(&self, name: &str, from: &str, to: &str) -> MicrosandboxResult<()> {
+        let url = format!("{}/v1/volumes/{}/fs/copy", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsTwoPathRequest {
+                from: from.into(),
+                to: to.into(),
+            })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/volumes/:name/fs/copy", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/volumes/:name/fs/copy").await?;
+        Ok(())
+    }
+
+    /// Rename a volume path.
+    pub async fn volume_fs_rename(
+        &self,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> MicrosandboxResult<()> {
+        let url = format!("{}/v1/volumes/{}/fs/rename", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&CloudFsTwoPathRequest {
+                from: from.into(),
+                to: to.into(),
+            })
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/volumes/:name/fs/rename", e))?;
+        let _: CloudMessageResponse = decode_json(resp, "POST /v1/volumes/:name/fs/rename").await?;
+        Ok(())
+    }
+
+    /// Check whether a volume path exists.
+    pub async fn volume_fs_exists(&self, name: &str, path: &str) -> MicrosandboxResult<bool> {
+        let url = format!(
+            "{}/v1/volumes/{}/fs/exists?path={}",
+            self.url,
+            urlencoding(name),
+            urlencoding(path)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/volumes/:name/fs/exists", e))?;
+        let body: CloudFsExistsResponse =
+            decode_json(resp, "GET /v1/volumes/:name/fs/exists").await?;
+        Ok(body.exists)
+    }
+
     /// Run a command via `GET /v1/sandboxes/:id/exec.cbor`.
     pub async fn exec(
         &self,
@@ -341,6 +819,70 @@ impl CloudBackend {
         }
     }
 
+    /// Run a command via `GET /v1/sandboxes/:id/exec.cbor` and return a streaming handle.
+    pub async fn exec_stream(
+        &self,
+        name: &str,
+        config: &SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+    ) -> MicrosandboxResult<ExecHandle> {
+        let sandbox = self.get_sandbox(name).await?;
+        let url = cloud_exec_ws_url(&self.url, &sandbox.id)?;
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec request: {e}")))?;
+        add_cloud_exec_headers(&mut request, &self.api_key)?;
+
+        let (socket, _) = connect_async(request)
+            .await
+            .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec websocket: {e}")))?;
+        let (mut writer, reader) = socket.split();
+
+        let ExecOptions {
+            args,
+            cwd,
+            user,
+            env,
+            rlimits,
+            timeout: _,
+            stdin: stdin_mode,
+            tty,
+        } = opts;
+        let req = build_exec_request(config, cmd, args, cwd, user, &env, &rlimits, tty, 24, 80);
+        send_cloud_exec_message(&mut writer, MessageType::ExecRequest, &req).await?;
+
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(cloud_exec_writer_task(writer, control_rx));
+
+        let stdin = match &stdin_mode {
+            StdinMode::Pipe => Some(ExecSink::new_cloud(CLOUD_EXEC_ID, control_tx.clone())),
+            _ => None,
+        };
+
+        if let StdinMode::Bytes(data) = stdin_mode {
+            let tx = control_tx.clone();
+            tokio::spawn(async move {
+                let _ = send_cloud_exec_control(&tx, MessageType::ExecStdin, &ExecStdin { data });
+                let _ = send_cloud_exec_control(
+                    &tx,
+                    MessageType::ExecStdin,
+                    &ExecStdin { data: Vec::new() },
+                );
+            });
+        }
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        tokio::spawn(cloud_exec_reader_task(reader, event_tx));
+
+        Ok(ExecHandle::new_cloud(
+            CLOUD_EXEC_ID,
+            event_rx,
+            stdin,
+            control_tx,
+        ))
+    }
+
     async fn exec_without_timeout(
         &self,
         name: &str,
@@ -353,22 +895,7 @@ impl CloudBackend {
         let mut request = url
             .into_client_request()
             .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec request: {e}")))?;
-        let bearer = format!("Bearer {}", self.api_key);
-        let mut auth_value = WsHeaderValue::from_str(&bearer).map_err(|e| {
-            MicrosandboxError::InvalidConfig(format!("invalid API key header value: {e}"))
-        })?;
-        auth_value.set_sensitive(true);
-        request.headers_mut().insert(WS_AUTHORIZATION, auth_value);
-        request.headers_mut().insert(
-            WS_USER_AGENT,
-            WsHeaderValue::from_str(&default_user_agent()).map_err(|e| {
-                MicrosandboxError::InvalidConfig(format!("invalid user-agent value: {e}"))
-            })?,
-        );
-        request.headers_mut().insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            WsHeaderValue::from_static(CLOUD_EXEC_SUBPROTOCOL),
-        );
+        add_cloud_exec_headers(&mut request, &self.api_key)?;
 
         let (socket, _) = connect_async(request)
             .await
@@ -664,6 +1191,29 @@ fn parse_cloud_log_source(source: &str) -> MicrosandboxResult<LogSource> {
 // Functions: Exec
 //--------------------------------------------------------------------------------------------------
 
+fn add_cloud_exec_headers(
+    request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+    api_key: &str,
+) -> MicrosandboxResult<()> {
+    let bearer = format!("Bearer {api_key}");
+    let mut auth_value = WsHeaderValue::from_str(&bearer).map_err(|e| {
+        MicrosandboxError::InvalidConfig(format!("invalid API key header value: {e}"))
+    })?;
+    auth_value.set_sensitive(true);
+    request.headers_mut().insert(WS_AUTHORIZATION, auth_value);
+    request.headers_mut().insert(
+        WS_USER_AGENT,
+        WsHeaderValue::from_str(&default_user_agent()).map_err(|e| {
+            MicrosandboxError::InvalidConfig(format!("invalid user-agent value: {e}"))
+        })?,
+    );
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        WsHeaderValue::from_static(CLOUD_EXEC_SUBPROTOCOL),
+    );
+    Ok(())
+}
+
 async fn send_cloud_exec_message<S, T>(
     writer: &mut S,
     t: MessageType,
@@ -674,12 +1224,137 @@ where
     T: serde::Serialize,
 {
     let msg = Message::with_payload(t, CLOUD_EXEC_ID, payload)?;
+    send_cloud_exec_raw_message(writer, &msg).await
+}
+
+async fn send_cloud_exec_raw_message<S>(writer: &mut S, msg: &Message) -> MicrosandboxResult<()>
+where
+    S: Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
     let mut buf = Vec::new();
     codec::encode_to_buf(&msg, &mut buf)?;
     writer
         .send(WsMessage::Binary(buf.into()))
         .await
         .map_err(|e| MicrosandboxError::Runtime(format!("cloud exec websocket write: {e}")))
+}
+
+fn send_cloud_exec_control<T: serde::Serialize>(
+    tx: &mpsc::UnboundedSender<Message>,
+    t: MessageType,
+    payload: &T,
+) -> MicrosandboxResult<()> {
+    let msg = Message::with_payload(t, CLOUD_EXEC_ID, payload)?;
+    tx.send(msg)
+        .map_err(|_| MicrosandboxError::Runtime("cloud exec websocket writer closed".into()))
+}
+
+async fn cloud_exec_writer_task<S>(mut writer: S, mut rx: mpsc::UnboundedReceiver<Message>)
+where
+    S: Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    while let Some(message) = rx.recv().await {
+        if send_cloud_exec_raw_message(&mut writer, &message)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = writer.close().await;
+}
+
+async fn cloud_exec_reader_task<R>(mut reader: R, tx: mpsc::UnboundedSender<ExecEvent>)
+where
+    R: Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut frame_buf = Vec::new();
+    while let Some(frame) = reader.next().await {
+        match frame {
+            Ok(WsMessage::Binary(bytes)) => {
+                frame_buf.extend_from_slice(&bytes);
+                loop {
+                    match codec::try_decode_from_buf(&mut frame_buf) {
+                        Ok(Some(msg)) => {
+                            if map_cloud_exec_message(msg, &tx) {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = tx.send(ExecEvent::Failed(cloud_exec_failed(format!(
+                                "cloud exec websocket decode: {error}"
+                            ))));
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(WsMessage::Close(_)) => return,
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx.send(ExecEvent::Failed(cloud_exec_failed(format!(
+                    "cloud exec websocket read: {error}"
+                ))));
+                return;
+            }
+        }
+    }
+}
+
+fn map_cloud_exec_message(msg: Message, tx: &mpsc::UnboundedSender<ExecEvent>) -> bool {
+    match msg.t {
+        MessageType::ExecStarted => match msg.payload::<ExecStarted>() {
+            Ok(started) => {
+                let _ = tx.send(ExecEvent::Started { pid: started.pid });
+                false
+            }
+            Err(_) => false,
+        },
+        MessageType::ExecStdout => match msg.payload::<ExecStdout>() {
+            Ok(out) => {
+                let _ = tx.send(ExecEvent::Stdout(Bytes::from(out.data)));
+                false
+            }
+            Err(_) => false,
+        },
+        MessageType::ExecStderr => match msg.payload::<ExecStderr>() {
+            Ok(err) => {
+                let _ = tx.send(ExecEvent::Stderr(Bytes::from(err.data)));
+                false
+            }
+            Err(_) => false,
+        },
+        MessageType::ExecExited => {
+            if let Ok(exited) = msg.payload::<ExecExited>() {
+                let _ = tx.send(ExecEvent::Exited { code: exited.code });
+            }
+            true
+        }
+        MessageType::ExecFailed => {
+            if let Ok(failed) = msg.payload::<ExecFailed>() {
+                let _ = tx.send(ExecEvent::Failed(failed));
+            }
+            true
+        }
+        MessageType::ExecStdinError => {
+            if let Ok(payload) = msg.payload::<microsandbox_protocol::exec::ExecStdinError>() {
+                let _ = tx.send(ExecEvent::StdinError(payload));
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn cloud_exec_failed(message: String) -> ExecFailed {
+    ExecFailed {
+        kind: microsandbox_protocol::exec::ExecFailureKind::Other,
+        errno: None,
+        errno_name: None,
+        message,
+        stage: Some("cloud-backend".into()),
+    }
 }
 
 fn cloud_exec_ws_url(base: &str, sandbox_id: &str) -> MicrosandboxResult<String> {
@@ -717,6 +1392,24 @@ async fn decode_json<T: serde::de::DeserializeOwned>(
             .json::<T>()
             .await
             .map_err(|e| MicrosandboxError::Custom(format!("{op}: failed to decode body: {e}")));
+    }
+    let body_text = resp.text().await.unwrap_or_default();
+    let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
+    Err(cloud_http_error(
+        status.as_u16(),
+        typed.as_ref(),
+        &body_text,
+        op,
+    ))
+}
+
+async fn decode_bytes(resp: Response, op: &str) -> MicrosandboxResult<Bytes> {
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .bytes()
+            .await
+            .map_err(|e| MicrosandboxError::Custom(format!("{op}: failed to read body: {e}")));
     }
     let body_text = resp.text().await.unwrap_or_default();
     let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
@@ -786,6 +1479,56 @@ fn cloud_error_message(body: Option<&CloudErrorBody>) -> Option<&str> {
             .and_then(|err| err.message.as_deref())
             .or(body.message.as_deref())
     })
+}
+
+fn sandbox_metrics_from_cloud(metrics: CloudSandboxMetrics) -> SandboxMetrics {
+    SandboxMetrics {
+        cpu_percent: metrics.cpu_percent,
+        vcpu_time_ns: metrics.vcpu_time_ns,
+        memory_bytes: metrics.memory_bytes,
+        memory_available_bytes: metrics.memory_available_bytes,
+        memory_host_resident_bytes: metrics.memory_host_resident_bytes,
+        memory_limit_bytes: metrics.memory_limit_bytes,
+        disk_read_bytes: metrics.disk_read_bytes,
+        disk_write_bytes: metrics.disk_write_bytes,
+        net_rx_bytes: metrics.net_rx_bytes,
+        net_tx_bytes: metrics.net_tx_bytes,
+        upper_used_bytes: metrics.upper_used_bytes,
+        upper_free_bytes: metrics.upper_free_bytes,
+        upper_host_allocated_bytes: metrics.upper_host_allocated_bytes,
+        uptime: Duration::from_millis(metrics.uptime_ms),
+        timestamp: metrics.timestamp,
+    }
+}
+
+fn fs_entry_from_cloud(entry: CloudFsEntry) -> FsEntry {
+    FsEntry {
+        path: entry.path,
+        kind: fs_entry_kind_from_cloud(entry.kind),
+        size: entry.size,
+        mode: entry.mode,
+        modified: entry.modified,
+    }
+}
+
+fn fs_metadata_from_cloud(metadata: CloudFsMetadata) -> FsMetadata {
+    FsMetadata {
+        kind: fs_entry_kind_from_cloud(metadata.kind),
+        size: metadata.size,
+        mode: metadata.mode,
+        readonly: metadata.readonly,
+        modified: metadata.modified,
+        created: metadata.created,
+    }
+}
+
+fn fs_entry_kind_from_cloud(kind: CloudFsEntryKind) -> FsEntryKind {
+    match kind {
+        CloudFsEntryKind::File => FsEntryKind::File,
+        CloudFsEntryKind::Directory => FsEntryKind::Directory,
+        CloudFsEntryKind::Symlink => FsEntryKind::Symlink,
+        CloudFsEntryKind::Other => FsEntryKind::Other,
+    }
 }
 
 /// Minimal percent-encoding for path segments. Avoids pulling in another crate
