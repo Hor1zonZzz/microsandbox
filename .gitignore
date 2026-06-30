@@ -15,6 +15,7 @@ private
 .history
 .DS_Store
 .zed
+local_docs/
 
 # microsandbox
 ignore/
