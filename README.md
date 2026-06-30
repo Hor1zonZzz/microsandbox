@@ -1,4 +1,170 @@
 <div align="center">
+
+# @hor1zonz/microsandbox — Cloud Adapter Fork
+
+<a href="https://www.npmjs.com/package/@hor1zonz/microsandbox"><img src="https://img.shields.io/badge/%40hor1zonz%2Fmicrosandbox-v0.0.1-CB3837?style=for-the-badge&logo=npm" alt="npm @hor1zonz/microsandbox v0.0.1"></a>
+<a href="https://github.com/superradcompany/microsandbox"><img src="https://img.shields.io/badge/fork%20of-superradcompany%2Fmicrosandbox-A770EF?style=for-the-badge&logo=github" alt="fork of superradcompany/microsandbox"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
+
+**A fork of [`superradcompany/microsandbox`](https://github.com/superradcompany/microsandbox) that adds a self-hostable cloud API gateway (`msb-cloud-adapter`) and a fully-wired cloud backend for the SDKs — so the same SDK code can talk to a remote (or your own) microsandbox host over HTTP, not just spawn local microVMs.**
+
+</div>
+
+> [!NOTE]
+> This is the **fork-specific section**. The complete, unmodified **upstream README is preserved below** → [jump to the original README](#-upstream-readme).
+
+## <img height="18" src="https://octicons-col.vercel.app/git-branch/A770EF" alt="fork">&nbsp;&nbsp;What this fork adds
+
+Upstream microsandbox boots microVMs as **local** child processes. This fork keeps all of that and adds a network-addressable "cloud" path on top of it:
+
+| Addition | Where | What it does |
+| --- | --- | --- |
+| **`msb-cloud-adapter` service** | [`crates/cloud-adapter`](./crates/cloud-adapter) | An Axum HTTP + WebSocket server that exposes the `msb-cloud` REST/WS contract on top of a **local** microsandbox runtime. Run it on any machine that can boot microVMs and you have your own self-hosted "cloud". |
+| **Cloud backend in the Rust SDK** | [`sdk/rust/lib/backend/cloud.rs`](./sdk/rust/lib/backend/cloud.rs) | `CloudBackend` (`url` + `api_key`, `from_env`, named profiles) wired through the full sandbox / volume / fs / exec / logs / metrics surface. |
+| **Cloud backend in the Node/TS SDK** | [`sdk/node-ts`](./sdk/node-ts) | `setDefaultBackend` / `withDefaultBackend` / `defaultBackendKind`, a `CloudHttpError` type, and CBOR exec-over-WebSocket support. |
+| **Published npm package** | `@hor1zonz/microsandbox` | The Node SDK is published under this scope (currently **darwin-arm64 / Apple Silicon** prebuilt). |
+| **Cloud ephemeral-stop cleanup** | SDK + adapter | Correctly tears down ephemeral sandboxes on `stop()` when running against the cloud backend. |
+
+The cloud backend is **API-compatible** with the local one: `Sandbox.builder(...).create()`, `exec`, `fs.*`, `logs`, `metrics`, and `Volume` all behave the same — only the transport changes.
+
+## <img height="18" src="https://octicons-col.vercel.app/server/A770EF" alt="architecture">&nbsp;&nbsp;Architecture
+
+```
+  your app (Rust / TypeScript SDK)
+            │  HTTP + WebSocket (Bearer API key)
+            ▼
+  ┌───────────────────────────┐
+  │   msb-cloud-adapter        │   serves the /v1 msb-cloud contract
+  │   (crates/cloud-adapter)   │
+  └────────────┬──────────────┘
+               │  in-process LocalBackend
+               ▼
+        microsandbox runtime  ──►  microVMs (libkrun)
+```
+
+The adapter boots real microVMs through the local runtime, so it must run on a host that can do so: **macOS (Apple Silicon)** or **Linux with KVM enabled**.
+
+## <img height="18" src="https://octicons-col.vercel.app/rocket/A770EF" alt="quickstart">&nbsp;&nbsp;Quick start: run your own cloud
+
+#### 1.&nbsp;&nbsp;Build & run the adapter
+
+```sh
+# Requires the msb runtime + libkrunfw under ~/.microsandbox (MSB_HOME).
+# Install the upstream CLI once if you don't have them:
+#   curl -fsSL https://install.microsandbox.dev | sh
+
+export MSB_CLOUD_ADAPTER_API_KEY="choose-a-strong-key"
+cargo run -p msb-cloud-adapter --release -- --api-key "$MSB_CLOUD_ADAPTER_API_KEY"
+# Listening on http://127.0.0.1:8088   (override with --bind / MSB_CLOUD_ADAPTER_BIND)
+# Health check:  curl http://127.0.0.1:8088/healthz
+```
+
+**Adapter configuration:**
+
+| Flag | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `--bind` | `MSB_CLOUD_ADAPTER_BIND` | `127.0.0.1:8088` | Socket address to listen on. |
+| `--api-key` | `MSB_CLOUD_ADAPTER_API_KEY` | _(required)_ | Bearer key every SDK request must present. |
+| — | `MSB_HOME` | `~/.microsandbox` | Where the `msb` binary + `libkrunfw` live. |
+
+#### 2.&nbsp;&nbsp;Point an SDK at it
+
+Both SDKs read `MSB_API_URL` + `MSB_API_KEY` (or use a named `MSB_PROFILE`):
+
+```sh
+export MSB_API_URL="http://127.0.0.1:8088"
+export MSB_API_KEY="choose-a-strong-key"   # must match the adapter's key
+```
+
+<details open>
+<summary><b>&nbsp;TypeScript (npm) →</b></summary>
+
+```sh
+npm i @hor1zonz/microsandbox
+```
+
+```typescript
+import { Sandbox, setDefaultBackend } from "@hor1zonz/microsandbox";
+
+// Route all SDK calls to the cloud adapter instead of spawning local microVMs.
+setDefaultBackend({
+  kind: "cloud",
+  url: process.env.MSB_API_URL!,
+  apiKey: process.env.MSB_API_KEY!,
+});
+
+await using sandbox = await Sandbox.builder("hello-cloud")
+  .image("alpine:3.19")
+  .cpus(1)
+  .memory(512)
+  .create();
+
+const output = await sandbox.shell("uname -m && echo 'hello from the cloud adapter'");
+console.log(output.stdout());
+```
+
+</details>
+
+<details>
+<summary><b>&nbsp;Rust →</b></summary>
+
+```rust
+use microsandbox::{CloudBackend, Sandbox, set_default_backend};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Reads MSB_API_URL + MSB_API_KEY from the environment.
+    set_default_backend(CloudBackend::from_env()?);
+
+    let sandbox = Sandbox::builder("hello-cloud")
+        .image("alpine:3.19")
+        .cpus(1)
+        .memory(512)
+        .create()
+        .await?;
+
+    let output = sandbox.shell("uname -m && echo 'hello from the cloud adapter'").await?;
+    print!("{}", output.stdout()?);
+
+    sandbox.stop().await?;
+    Ok(())
+}
+```
+
+</details>
+
+> Runnable end-to-end examples live in [`examples/typescript/cloud-backend`](./examples/typescript/cloud-backend) and [`examples/rust/cloud-backend`](./examples/rust/cloud-backend).
+
+## <img height="18" src="https://octicons-col.vercel.app/plug/A770EF" alt="api">&nbsp;&nbsp;Cloud HTTP API surface
+
+All routes are under `/v1` and require an `Authorization: Bearer <api-key>` header.
+
+- **Sandboxes** — create / list / get / start / stop / kill / drain / destroy
+- **Filesystem** — `fs/read`, `fs/write`, `fs/list`, `fs/stat`, `fs/mkdir`, `fs/copy`, `fs/rename`, `fs/exists`, delete
+- **Exec** — `exec.cbor` over WebSocket (`msb.cbor` subprotocol)
+- **Logs** — Server-Sent Events stream (`/logs`)
+- **Metrics** — live CPU / memory / network (`/metrics`)
+- **Volumes** — create / list / get / remove, plus the same `fs/*` operations
+
+See [`crates/cloud-adapter/bin/main.rs`](./crates/cloud-adapter/bin/main.rs) for the full route table.
+
+## <img height="18" src="https://octicons-col.vercel.app/alert/A770EF" alt="notes">&nbsp;&nbsp;Notes & compatibility
+
+- **Prebuilt platform:** the published `@hor1zonz/microsandbox` ships a prebuilt native binary for **macOS Apple Silicon (darwin-arm64)** only. Other platforms must build the SDK from source.
+- **Relationship to upstream:** this fork tracks [`superradcompany/microsandbox`](https://github.com/superradcompany/microsandbox) and only *adds* the cloud adapter + cloud backend wiring. The local-microVM workflow documented below is unchanged.
+- **License:** unchanged — [Apache 2.0](./LICENSE).
+
+<br />
+
+---
+
+<div align="center"><a id="-upstream-readme"></a><sub><b>↓ &nbsp; Everything below is the original upstream README, preserved unchanged. &nbsp; ↓</b></sub></div>
+
+---
+
+<br />
+
+<div align="center">
     <a href="./#gh-dark-mode-only" target="_blank" align="center">
         <img width="35%" src="./assets/microsandbox-gh-banner-dark.png" alt="microsandbox-banner-xl-dark">
     </a>
